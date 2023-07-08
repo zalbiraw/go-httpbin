@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -24,11 +25,15 @@ const Base64MaxLen = 2000
 // requestHeaders takes in incoming request and returns an http.Header map
 // suitable for inclusion in our response data structures.
 //
-// This is necessary to ensure that the incoming Host header is included,
-// because golang only exposes that header on the http.Request struct itself.
+// This is necessary to ensure that the incoming Host and Transfer-Encoding
+// headers are included, because golang only exposes those values on the
+// http.Request struct itself.
 func getRequestHeaders(r *http.Request) http.Header {
 	h := r.Header
 	h.Set("Host", r.Host)
+	if len(r.TransferEncoding) > 0 {
+		h.Set("Transfer-Encoding", strings.Join(r.TransferEncoding, ","))
+	}
 	return h
 }
 
@@ -57,6 +62,9 @@ func getURL(r *http.Request) *url.URL {
 		scheme = r.Header.Get("X-Forwarded-Protocol")
 	}
 	if scheme == "" && r.Header.Get("X-Forwarded-Ssl") == "on" {
+		scheme = "https"
+	}
+	if scheme == "" && r.TLS != nil {
 		scheme = "https"
 	}
 	if scheme == "" {
@@ -106,6 +114,39 @@ func writeHTML(w http.ResponseWriter, body []byte, status int) {
 	writeResponse(w, status, htmlContentType, body)
 }
 
+func writeError(w http.ResponseWriter, code int, err error) {
+	resp := errorRespnose{
+		Error:      http.StatusText(code),
+		StatusCode: code,
+	}
+	if err != nil {
+		resp.Detail = err.Error()
+	}
+	writeJSON(code, w, resp)
+}
+
+// parseFiles handles reading the contents of files in a multipart FileHeader
+// and returning a map that can be used as the Files attribute of a response
+func parseFiles(fileHeaders map[string][]*multipart.FileHeader) (map[string][]string, error) {
+	files := map[string][]string{}
+	for k, fs := range fileHeaders {
+		files[k] = []string{}
+
+		for _, f := range fs {
+			fh, err := f.Open()
+			if err != nil {
+				return nil, err
+			}
+			contents, err := io.ReadAll(fh)
+			if err != nil {
+				return nil, err
+			}
+			files[k] = append(files[k], string(contents))
+		}
+	}
+	return files, nil
+}
+
 // parseBody handles parsing a request body into our standard API response,
 // taking care to only consume the request body once based on the Content-Type
 // of the request. The given bodyResponse will be modified.
@@ -113,43 +154,38 @@ func writeHTML(w http.ResponseWriter, body []byte, status int) {
 // Note: this function expects callers to limit the the maximum size of the
 // request body. See, e.g., the limitRequestSize middleware.
 func parseBody(w http.ResponseWriter, r *http.Request, resp *bodyResponse) error {
-	if r.Body == nil {
-		return nil
-	}
+	defer r.Body.Close()
 
 	// Always set resp.Data to the incoming request body, in case we don't know
 	// how to handle the content type
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		r.Body.Close()
 		return err
 	}
-	resp.Data = string(body)
 
 	// After reading the body to populate resp.Data, we need to re-wrap it in
 	// an io.Reader for further processing below
-	r.Body.Close()
 	r.Body = io.NopCloser(bytes.NewBuffer(body))
 
-	ct := r.Header.Get("Content-Type")
-
-	// Strip of charset encoding, if present
-	if strings.Contains(ct, ";") {
-		ct = strings.Split(ct, ";")[0]
+	// if we read an empty body, there's no need to do anything further
+	if len(body) == 0 {
+		return nil
 	}
 
-	switch {
-	// cases where we don't need to parse the body
-	case strings.HasPrefix(ct, "html/"):
-		fallthrough
-	case strings.HasPrefix(ct, "text/"):
-		// string body is already set above
+	// Always store the "raw" incoming request body
+	resp.Data = string(body)
+
+	contentType, _, _ := strings.Cut(r.Header.Get("Content-Type"), ";")
+
+	switch contentType {
+	case "text/html", "text/plain":
+		// no need for extra parsing, string body is already set above
 		return nil
 
-	case ct == "application/x-www-form-urlencoded":
-		// r.ParseForm() does not populate r.PostForm for DELETE or GET requests, but
-		// we need it to for compatibility with the httpbin implementation, so
-		// we trick it with this ugly hack.
+	case "application/x-www-form-urlencoded":
+		// r.ParseForm() does not populate r.PostForm for DELETE or GET
+		// requests, but we need it to for compatibility with the httpbin
+		// implementation, so we trick it with this ugly hack.
 		if r.Method == http.MethodDelete || r.Method == http.MethodGet {
 			originalMethod := r.Method
 			r.Method = http.MethodPost
@@ -159,7 +195,8 @@ func parseBody(w http.ResponseWriter, r *http.Request, resp *bodyResponse) error
 			return err
 		}
 		resp.Form = r.PostForm
-	case ct == "multipart/form-data":
+
+	case "multipart/form-data":
 		// The memory limit here only restricts how many parts will be kept in
 		// memory before overflowing to disk:
 		// https://golang.org/pkg/net/http/#Request.ParseMultipartForm
@@ -167,16 +204,21 @@ func parseBody(w http.ResponseWriter, r *http.Request, resp *bodyResponse) error
 			return err
 		}
 		resp.Form = r.PostForm
-	case ct == "application/json":
-		err := json.NewDecoder(r.Body).Decode(&resp.JSON)
-		if err != nil && err != io.EOF {
+		files, err := parseFiles(r.MultipartForm.File)
+		if err != nil {
+			return err
+		}
+		resp.Files = files
+
+	case "application/json":
+		if err := json.NewDecoder(r.Body).Decode(&resp.JSON); err != nil {
 			return err
 		}
 
 	default:
-		// If we don't have a special case for the content type, we'll just return it encoded as base64 data url
-		// we strip off any charset information, since we will re-encode the body
-		resp.Data = encodeData(body, ct)
+		// If we don't have a special case for the content type, return it
+		// encoded as base64 data url
+		resp.Data = encodeData(body, contentType)
 	}
 
 	return nil
@@ -184,13 +226,11 @@ func parseBody(w http.ResponseWriter, r *http.Request, resp *bodyResponse) error
 
 // return provided string as base64 encoded data url, with the given content type
 func encodeData(body []byte, contentType string) string {
-	data := base64.URLEncoding.EncodeToString(body)
-
 	// If no content type is provided, default to application/octet-stream
 	if contentType == "" {
-		contentType = "application/octet-stream"
+		contentType = binaryContentType
 	}
-
+	data := base64.URLEncoding.EncodeToString(body)
 	return string("data:" + contentType + ";base64," + data)
 }
 
@@ -315,8 +355,7 @@ func sha1hash(input string) string {
 
 func uuidv4() string {
 	buff := make([]byte, 16)
-	_, err := crypto_rand.Read(buff[:])
-	if err != nil {
+	if _, err := crypto_rand.Read(buff[:]); err != nil {
 		panic(err)
 	}
 	buff[6] = (buff[6] & 0x0f) | 0x40 // Version 4
