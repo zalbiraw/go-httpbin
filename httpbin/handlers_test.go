@@ -61,6 +61,7 @@ func TestMain(m *testing.M) {
 		WithMaxBodySize(maxBodySize),
 		WithMaxDuration(maxDuration),
 		WithObserver(StdLogObserver(log.New(io.Discard, "", 0))),
+		WithExcludeHeaders("x-ignore-*,x-info-this-key"),
 	)
 	srv, client = newTestServer(app)
 	defer srv.Close()
@@ -165,6 +166,28 @@ func TestGet(t *testing.T) {
 		result := doGetRequest(t, "/get", params, nil)
 		assert.Equal(t, result.Args.Encode(), params.Encode(), "args mismatch")
 		assert.Equal(t, result.Method, "GET", "method mismatch")
+	})
+
+	t.Run("will ignore specific headers", func(t *testing.T) {
+		t.Parallel()
+
+		params := url.Values{}
+		params.Set("foo", "foo")
+		params.Add("bar", "bar1")
+		params.Add("bar", "bar2")
+
+		header := http.Header{}
+
+		header.Set("X-Ignore-Foo", "foo")
+		header.Set("X-Info-Foo", "bar")
+		header.Set("x-info-this-key", "baz")
+
+		result := doGetRequest(t, "/get", params, header)
+		assert.Equal(t, result.Args.Encode(), params.Encode(), "args mismatch")
+		assert.Equal(t, result.Method, "GET", "method mismatch")
+		assertHeaderEqual(t, &result.Headers, "X-Ignore-Foo", "")
+		assertHeaderEqual(t, &result.Headers, "x-info-this-key", "")
+		assertHeaderEqual(t, &result.Headers, "X-Info-Foo", "bar")
 	})
 
 	t.Run("only_allows_gets", func(t *testing.T) {
@@ -451,6 +474,7 @@ func testRequestWithBody(t *testing.T, verb, path string) {
 		testRequestWithBodyBinaryBody,
 		testRequestWithBodyBodyTooBig,
 		testRequestWithBodyEmptyBody,
+		testRequestWithBodyExpect100Continue,
 		testRequestWithBodyFormEncodedBody,
 		testRequestWithBodyFormEncodedBodyNoContentType,
 		testRequestWithBodyHTML,
@@ -568,6 +592,172 @@ func testRequestWithBodyHTML(t *testing.T, verb, path string) {
 	assert.StatusCode(t, resp, http.StatusOK)
 	assert.ContentType(t, resp, jsonContentType)
 	assert.BodyContains(t, resp, data)
+}
+
+func testRequestWithBodyExpect100Continue(t *testing.T, verb, path string) {
+	// The stdlib http client automagically handles 100 Continue responses
+	// by continuing the request until a "final" 200 OK response is
+	// received, which prevents us from confirming that a 100 Continue
+	// response is sent when using the http client directly.
+	//
+	// So, here we instead manally write the request to the wire in two
+	// steps, confirming that we receive a 100 Continue response before
+	// sending the body and getting the normal expected response.
+
+	t.Run("non-zero content-length okay", func(t *testing.T) {
+		t.Parallel()
+
+		conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+		assert.NilError(t, err)
+		defer conn.Close()
+
+		body := []byte("test body")
+
+		req := newTestRequestWithBody(t, verb, path, bytes.NewReader(body))
+		req.Header.Set("Expect", "100-continue")
+		req.Header.Set("Content-Type", "text/plain")
+
+		reqBytes, _ := httputil.DumpRequestOut(req, false)
+		t.Logf("raw request:\n%q", reqBytes)
+
+		if !strings.Contains(string(reqBytes), "Content-Length: 9") {
+			t.Fatalf("expected request to contain Content-Length header")
+		}
+
+		// first, we write the request line and headers -- but NOT the body --
+		// which should cause the server to respond with a 100 Continue
+		// response.
+		{
+			n, err := conn.Write(reqBytes)
+			assert.NilError(t, err)
+			assert.Equal(t, n, len(reqBytes), "incorrect number of bytes written")
+
+			resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+			assert.NilError(t, err)
+			assert.StatusCode(t, resp, http.StatusContinue)
+		}
+
+		// Once we've gotten the 100 Continue response, we write the body. After
+		// that, we should get a normal 200 OK response along with the expected
+		// result.
+		{
+			n, err := conn.Write(body)
+			assert.NilError(t, err)
+			assert.Equal(t, n, len(body), "incorrect number of bytes written")
+
+			resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+			assert.NilError(t, err)
+			assert.StatusCode(t, resp, http.StatusOK)
+
+			got := must.Unmarshal[bodyResponse](t, resp.Body)
+			assert.Equal(t, got.Data, string(body), "incorrect body")
+		}
+	})
+
+	t.Run("transfer-encoding:chunked okay", func(t *testing.T) {
+		t.Parallel()
+
+		conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+		assert.NilError(t, err)
+		defer conn.Close()
+
+		body := []byte("test body")
+
+		reqParts := []string{
+			fmt.Sprintf("%s %s HTTP/1.1", verb, path),
+			"Host: test",
+			"Content-Type: text/plain",
+			"Expect: 100-continue",
+			"Transfer-Encoding: chunked",
+		}
+		reqBytes := []byte(strings.Join(reqParts, "\r\n") + "\r\n\r\n")
+		t.Logf("raw request:\n%q", reqBytes)
+
+		// first, we write the request line and headers -- but NOT the body --
+		// which should cause the server to respond with a 100 Continue
+		// response.
+		{
+			n, err := conn.Write(reqBytes)
+			assert.NilError(t, err)
+			assert.Equal(t, n, len(reqBytes), "incorrect number of bytes written")
+
+			resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+			assert.NilError(t, err)
+			assert.StatusCode(t, resp, http.StatusContinue)
+		}
+
+		// Once we've gotten the 100 Continue response, we write the body. After
+		// that, we should get a normal 200 OK response along with the expected
+		// result.
+		{
+			// write chunk size
+			_, err := conn.Write([]byte("9\r\n"))
+			assert.NilError(t, err)
+
+			// write chunk data
+			n, err := conn.Write(append(body, "\r\n"...))
+			assert.NilError(t, err)
+			assert.Equal(t, n, len(body)+2, "incorrect number of bytes written")
+
+			// write empty terminating chunk
+			_, err = conn.Write([]byte("0\r\n\r\n"))
+			assert.NilError(t, err)
+
+			resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+			assert.NilError(t, err)
+			assert.StatusCode(t, resp, http.StatusOK)
+
+			got := must.Unmarshal[bodyResponse](t, resp.Body)
+			assert.Equal(t, got.Data, string(body), "incorrect body")
+		}
+	})
+
+	t.Run("zero content-length ignored", func(t *testing.T) {
+		// The Go stdlib's Expect:100-continue handling requires either a a)
+		// non-zero Content-Length header or b) Transfer-Encoding:chunked
+		// header to be present.  Otherwise, the Expect header is ignored and
+		// the request is processed normally.
+		t.Parallel()
+
+		conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+		assert.NilError(t, err)
+		defer conn.Close()
+
+		req := newTestRequest(t, verb, path)
+		req.Header.Set("Expect", "100-continue")
+
+		reqBytes, _ := httputil.DumpRequestOut(req, false)
+		t.Logf("raw request:\n%q", reqBytes)
+
+		// For GET and DELETE requests, it appears the Go stdlib does not
+		// include a Content-Length:0 header, so we ensure that the header is
+		// either missing or has a value of 0.
+		switch verb {
+		case "GET", "DELETE":
+			if strings.Contains(string(reqBytes), "Content-Length:") {
+				t.Fatalf("expected no Content-Length header for %s request", verb)
+			}
+		default:
+			if !strings.Contains(string(reqBytes), "Content-Length: 0") {
+				t.Fatalf("expected Content-Length:0 header for %s request", verb)
+			}
+		}
+
+		n, err := conn.Write(reqBytes)
+		assert.NilError(t, err)
+		assert.Equal(t, n, len(reqBytes), "incorrect number of bytes written")
+
+		resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+		assert.NilError(t, err)
+
+		// Note: the server should NOT send a 100 Continue response here,
+		// because we send a request without a Content-Length header or with a
+		// Content-Length: 0 header.
+		assert.StatusCode(t, resp, http.StatusOK)
+
+		got := must.Unmarshal[bodyResponse](t, resp.Body)
+		assert.Equal(t, got.Data, "", "incorrect body")
+	})
 }
 
 func testRequestWithBodyFormEncodedBodyNoContentType(t *testing.T, verb, path string) {
@@ -799,6 +989,7 @@ func TestStatus(t *testing.T) {
 		headers map[string]string
 		body    string
 	}{
+		// 100 is tested as a special case below
 		{200, nil, ""},
 		{300, map[string]string{"Location": "/image/jpeg"}, `<!doctype html>
 <head>
@@ -822,6 +1013,8 @@ func TestStatus(t *testing.T) {
 </html>`},
 		{401, unauthorizedHeaders, ""},
 		{418, nil, "I'm a teapot!"},
+		{500, nil, ""}, // maximum allowed status code
+		{599, nil, ""}, // maximum allowed status code
 	}
 
 	for _, test := range tests {
@@ -848,6 +1041,8 @@ func TestStatus(t *testing.T) {
 		{"/status/200/foo", http.StatusNotFound},
 		{"/status/3.14", http.StatusBadRequest},
 		{"/status/foo", http.StatusBadRequest},
+		{"/status/600", http.StatusBadRequest},
+		{"/status/1024", http.StatusBadRequest},
 	}
 
 	for _, test := range errorTests {
@@ -860,6 +1055,34 @@ func TestStatus(t *testing.T) {
 			assert.StatusCode(t, resp, test.status)
 		})
 	}
+
+	t.Run("HTTP 100 Continue status code supported", func(t *testing.T) {
+		// The stdlib http client automagically handles 100 Continue responses
+		// by continuing the request until a "final" 200 OK response is
+		// received, which prevents us from confirming that a 100 Continue
+		// response is sent when using the http client directly.
+		//
+		// So, here we instead manally write the request to the wire and read
+		// the initial response, which will give us access to the 100 Continue
+		// indication we need.
+		t.Parallel()
+
+		conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+		assert.NilError(t, err)
+		defer conn.Close()
+
+		req := newTestRequest(t, "GET", "/status/100")
+		reqBytes, err := httputil.DumpRequestOut(req, false)
+		assert.NilError(t, err)
+
+		n, err := conn.Write(reqBytes)
+		assert.NilError(t, err)
+		assert.Equal(t, n, len(reqBytes), "incorrect number of bytes written")
+
+		resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+		assert.NilError(t, err)
+		assert.StatusCode(t, resp, http.StatusContinue)
+	})
 }
 
 func TestUnstable(t *testing.T) {
@@ -1712,9 +1935,9 @@ func TestDrip(t *testing.T) {
 		assert.NilError(t, err)
 		defer conn.Close()
 
-		n, err := conn.Write(append(reqBytes, []byte("\r\n\r\n")...))
+		n, err := conn.Write(reqBytes)
 		assert.NilError(t, err)
-		assert.Equal(t, n, len(reqBytes)+4, "incorrect number of bytes written")
+		assert.Equal(t, n, len(reqBytes), "incorrect number of bytes written")
 
 		resp, err := http.ReadResponse(bufio.NewReader(conn), req)
 		assert.NilError(t, err)
@@ -2719,4 +2942,12 @@ func mustParseResponse[T any](t *testing.T, resp *http.Response) T {
 func consumeAndCloseBody(resp *http.Response) {
 	_, _ = io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
+}
+
+func assertHeaderEqual(t *testing.T, header *http.Header, key, want string) {
+	t.Helper()
+	got := header.Get(key)
+	if want != got {
+		t.Fatalf("expected header %s=%#v, got %#v", key, want, got)
+	}
 }

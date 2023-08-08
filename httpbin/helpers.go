@@ -13,6 +13,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,11 +29,14 @@ const Base64MaxLen = 2000
 // This is necessary to ensure that the incoming Host and Transfer-Encoding
 // headers are included, because golang only exposes those values on the
 // http.Request struct itself.
-func getRequestHeaders(r *http.Request) http.Header {
+func getRequestHeaders(r *http.Request, fn headersProcessorFunc) http.Header {
 	h := r.Header
 	h.Set("Host", r.Host)
 	if len(r.TransferEncoding) > 0 {
 		h.Set("Transfer-Encoding", strings.Join(r.TransferEncoding, ","))
+	}
+	if fn != nil {
+		return fn(h)
 	}
 	return h
 }
@@ -234,6 +238,21 @@ func encodeData(body []byte, contentType string) string {
 	return string("data:" + contentType + ";base64," + data)
 }
 
+func parseStatusCode(input string) (int, error) {
+	return parseBoundedStatusCode(input, 100, 599)
+}
+
+func parseBoundedStatusCode(input string, min, max int) (int, error) {
+	code, err := strconv.Atoi(input)
+	if err != nil {
+		return 0, fmt.Errorf("invalid status code: %q: %w", input, err)
+	}
+	if code < min || code > max {
+		return 0, fmt.Errorf("invalid status code: %d not in range [%d, %d]", code, min, max)
+	}
+	return code, nil
+}
+
 // parseDuration takes a user's input as a string and attempts to convert it
 // into a time.Duration. If not given as a go-style duration string, the input
 // is assumed to be seconds as a float.
@@ -417,4 +436,63 @@ func (b *base64Helper) Encode() ([]byte, error) {
 // Decode - decode data from base64
 func (b *base64Helper) Decode() ([]byte, error) {
 	return base64.URLEncoding.DecodeString(b.data)
+}
+
+func wildCardToRegexp(pattern string) string {
+	components := strings.Split(pattern, "*")
+	if len(components) == 1 {
+		// if len is 1, there are no *'s, return exact match pattern
+		return "^" + pattern + "$"
+	}
+	var result strings.Builder
+	for i, literal := range components {
+
+		// Replace * with .*
+		if i > 0 {
+			result.WriteString(".*")
+		}
+
+		// Quote any regular expression meta characters in the
+		// literal text.
+		result.WriteString(regexp.QuoteMeta(literal))
+	}
+	return "^" + result.String() + "$"
+}
+
+func createExcludeHeadersProcessor(excludeRegex *regexp.Regexp) headersProcessorFunc {
+	return func(headers http.Header) http.Header {
+		result := make(http.Header)
+		for k, v := range headers {
+			matched := excludeRegex.Match([]byte(k))
+			if matched {
+				continue
+			}
+			result[k] = v
+		}
+
+		return result
+	}
+}
+
+func createFullExcludeRegex(excludeHeaders string) *regexp.Regexp {
+	// comma separated list of headers to exclude from response
+	tmp := strings.Split(excludeHeaders, ",")
+
+	tmpRegexStrings := make([]string, 0)
+	for _, v := range tmp {
+		s := strings.TrimSpace(v)
+		if len(s) == 0 {
+			continue
+		}
+		pattern := wildCardToRegexp(s)
+		tmpRegexStrings = append(tmpRegexStrings, pattern)
+	}
+
+	if len(tmpRegexStrings) > 0 {
+		tmpRegexStr := strings.Join(tmpRegexStrings, "|")
+		result := regexp.MustCompile("(?i)" + "(" + tmpRegexStr + ")")
+		return result
+	}
+
+	return nil
 }
