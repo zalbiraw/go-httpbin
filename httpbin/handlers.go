@@ -53,6 +53,13 @@ func (h *HTTPBin) UTF8(w http.ResponseWriter, _ *http.Request) {
 	writeHTML(w, mustStaticAsset("utf8.html"), http.StatusOK)
 }
 
+// OpenAPI renders an OpenAPI spec
+func (h *HTTPBin) OpenAPI(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/yaml")
+	w.WriteHeader(http.StatusOK)
+	w.Write(mustStaticAsset("openapi.yaml"))
+}
+
 // Get handles HTTP GET requests
 func (h *HTTPBin) Get(w http.ResponseWriter, r *http.Request) {
 	writeJSON(http.StatusOK, w, &noBodyResponse{
