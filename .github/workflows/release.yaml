@@ -49,7 +49,7 @@ jobs:
           DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
         with:
           images: |
-            mccutchen/go-httpbin
+            zalbiraw/go-httpbin
             ghcr.io/${{ github.repository }}
           tags: |
             # For releases, use the standard tags and special "latest" tag
